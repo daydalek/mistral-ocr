@@ -17,12 +17,48 @@ import subprocess
 import i18n
 from i18n import _
 
+# 导入Pillow库用于图像处理
+try:
+    from PIL import Image
+    PILLOW_AVAILABLE = True
+except ImportError:
+    PILLOW_AVAILABLE = False
+
 # 尝试导入tkinterdnd2用于拖放功能
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     TKDND_AVAILABLE = True
 except ImportError:
     TKDND_AVAILABLE = False
+
+# 支持的图像格式
+SUPPORTED_IMAGE_FORMATS = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif']
+
+def convert_image_to_pdf(image_path, output_path=None):
+    """将图像文件转换为PDF"""
+    if not PILLOW_AVAILABLE:
+        raise ImportError("需要安装Pillow库以支持图像转换: pip install pillow")
+    
+    # 生成输出PDF路径（如果未指定）
+    if output_path is None:
+        output_path = os.path.splitext(image_path)[0] + ".pdf"
+    
+    # 打开图像文件
+    image = Image.open(image_path)
+    
+    # 如果图像不是RGB模式（如RGBA, CMYK等），转换为RGB
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    
+    # 保存为PDF
+    image.save(output_path, "PDF", resolution=100.0)
+    
+    return output_path
+
+def is_image_file(file_path):
+    """检查文件是否为支持的图像格式"""
+    ext = os.path.splitext(file_path)[1].lower()
+    return ext in SUPPORTED_IMAGE_FORMATS
 
 def replace_images_in_markdown(markdown_str: str, images_dict: dict) -> str:
     for img_name, img_path in images_dict.items():
@@ -82,7 +118,6 @@ def split_pdf(pdf_path: str, max_size_mb: float = 45.0) -> list:
     split_files = []
     
     # Start with an estimate of pages per chunk
-    # A very rough estimate: if 100 pages is X MB, then max_size_mb would be approximately (max_size_mb * 100) / X pages
     file_size_mb = get_pdf_size_mb(pdf_path)
     pages_per_mb = total_pages / file_size_mb
     estimated_pages_per_chunk = int(max_size_mb * pages_per_mb * 0.9)  # 0.9 as safety factor
@@ -167,70 +202,115 @@ def merge_partial_results(output_dir: str, partial_files: list) -> None:
         f.write("\n\n".join(all_content))
 
 def process_pdf(pdf_path, api_key, progress_callback=None, output_base_dir=None):
+    """处理PDF文件或转换后的图像文件"""
     # Initialize client
     client = Mistral(api_key=api_key)
+    
+    # 检查文件类型，如果是图像则先转换为PDF
+    original_is_image = is_image_file(pdf_path)
+    converted_pdf_path = None
+    
+    if original_is_image:
+        if progress_callback:
+            progress_callback(0, 1, f"检测到图像文件，正在转换为PDF...")
+        
+        # 创建临时目录用于转换文件
+        temp_dir = tempfile.mkdtemp()
+        try:
+            # 转换图像为PDF
+            file_name = os.path.basename(pdf_path)
+            converted_pdf_path = os.path.join(temp_dir, os.path.splitext(file_name)[0] + ".pdf")
+            convert_image_to_pdf(pdf_path, converted_pdf_path)
+            
+            if progress_callback:
+                progress_callback(0.2, 1, f"图像已转换为PDF，准备进行OCR处理...")
+            
+            # 使用转换后的PDF路径
+            pdf_path = converted_pdf_path
+        except Exception as e:
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            raise Exception(f"图像转换失败: {str(e)}")
     
     # Create output directory name
     pdf_file = Path(pdf_path)
     
     # 使用指定的保存路径或默认路径，并使用国际化的目录名称前缀
     ocr_dir_prefix = _("ocr_result_dir")
-    if output_base_dir:
-        output_dir = os.path.join(output_base_dir, f"{ocr_dir_prefix}{pdf_file.stem}")
+    
+    # 对于图像文件，使用原始图像文件名
+    if original_is_image:
+        original_file = Path(pdf_path if not converted_pdf_path else os.path.splitext(pdf_path)[0] + os.path.splitext(pdf_path)[1])
+        file_stem = original_file.stem
     else:
-        output_dir = f"{ocr_dir_prefix}{pdf_file.stem}"
+        file_stem = pdf_file.stem
+    
+    if output_base_dir:
+        output_dir = os.path.join(output_base_dir, f"{ocr_dir_prefix}{file_stem}")
+    else:
+        output_dir = f"{ocr_dir_prefix}{file_stem}"
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # Check if the PDF needs splitting
-    pdf_size_mb = get_pdf_size_mb(pdf_path)
-    
-    if pdf_size_mb <= 45:  # Using 45MB as a safe threshold
-        # Process the PDF directly
-        if progress_callback:
-            progress_callback(0, 1)
-        process_pdf_chunk(pdf_path, client, output_dir, 0)
-        if progress_callback:
-            progress_callback(1, 1)
-        return output_dir
-    else:
-        # Split the PDF and process chunks
-        if progress_callback:
-            progress_callback(0, 1, f"PDF size ({pdf_size_mb:.2f} MB) exceeds 50MB limit. Splitting into smaller chunks...")
-        split_files, temp_dir = split_pdf(pdf_path)
+    try:
+        # Check if the PDF needs splitting
+        pdf_size_mb = get_pdf_size_mb(pdf_path)
         
-        try:
-            partial_results = []
-            page_offset = 0
-            
-            # Process each chunk
-            for i, chunk_path in enumerate(split_files):
-                if progress_callback:
-                    progress_callback(i, len(split_files), f"Processing chunk {i+1}/{len(split_files)}...")
-                chunk_size_mb = get_pdf_size_mb(chunk_path)
-                
-                # Get number of pages in this chunk
-                with open(chunk_path, 'rb') as f:
-                    chunk_reader = PyPDF2.PdfReader(f)
-                    chunk_pages = len(chunk_reader.pages)
-                
-                # Process the chunk
-                partial_file = process_pdf_chunk(chunk_path, client, output_dir, page_offset)
-                partial_results.append(partial_file)
-                
-                # Update page offset for the next chunk
-                page_offset += chunk_pages
-            
-            # Merge results
+        if pdf_size_mb <= 45:  # Using 45MB as a safe threshold
+            # Process the PDF directly
             if progress_callback:
-                progress_callback(len(split_files), len(split_files), "Merging results...")
-            merge_partial_results(output_dir, partial_results)
+                progress_callback(0.3 if original_is_image else 0, 1)
+            process_pdf_chunk(pdf_path, client, output_dir, 0)
+            if progress_callback:
+                progress_callback(1, 1)
+        else:
+            # Split the PDF and process chunks
+            if progress_callback:
+                progress_callback(0.3 if original_is_image else 0, 1, f"PDF size ({pdf_size_mb:.2f} MB) exceeds 50MB limit. Splitting into smaller chunks...")
+            split_files, temp_split_dir = split_pdf(pdf_path)
             
-            return output_dir
-            
-        finally:
-            # Clean up temporary files
-            shutil.rmtree(temp_dir)
+            try:
+                partial_results = []
+                page_offset = 0
+                
+                # Process each chunk
+                for i, chunk_path in enumerate(split_files):
+                    progress_base = 0.3 if original_is_image else 0
+                    progress_scale = 0.7 if original_is_image else 1.0
+                    if progress_callback:
+                        progress_callback(
+                            progress_base + (i / len(split_files)) * progress_scale, 
+                            1, 
+                            f"Processing chunk {i+1}/{len(split_files)}..."
+                        )
+                    
+                    # Get number of pages in this chunk
+                    with open(chunk_path, 'rb') as f:
+                        chunk_reader = PyPDF2.PdfReader(f)
+                        chunk_pages = len(chunk_reader.pages)
+                    
+                    # Process the chunk
+                    partial_file = process_pdf_chunk(chunk_path, client, output_dir, page_offset)
+                    partial_results.append(partial_file)
+                    
+                    # Update page offset for the next chunk
+                    page_offset += chunk_pages
+                
+                # Merge results
+                if progress_callback:
+                    progress_callback(0.95, 1, "Merging results...")
+                merge_partial_results(output_dir, partial_results)
+                
+            finally:
+                # Clean up temporary files
+                shutil.rmtree(temp_split_dir)
+        
+        return output_dir
+    
+    finally:
+        # 清理转换文件的临时目录
+        if original_is_image and converted_pdf_path and os.path.exists(os.path.dirname(converted_pdf_path)):
+            shutil.rmtree(os.path.dirname(converted_pdf_path))
 
 class Config:
     """Class to handle configuration and API key persistence"""
@@ -562,21 +642,26 @@ class OCRApp(tk.Tk if not TKDND_AVAILABLE else TkinterDnD.Tk):
         # 处理拖放的所有文件
         added_count = 0
         for file_path in file_paths:
-            if file_path.lower().endswith('.pdf'):
+            # 检查文件是否为PDF或支持的图像格式
+            if file_path.lower().endswith('.pdf') or is_image_file(file_path):
                 self.add_file_to_queue(file_path)
                 added_count += 1
         
         # 提供视觉反馈
         if added_count > 0:
-            self.status_label.config(text=f"已添加 {added_count} 个PDF文件到队列")
+            self.status_label.config(text=f"已添加 {added_count} 个文件到队列")
         else:
-            messagebox.showerror("无效文件", "请拖放PDF文件。")
+            messagebox.showerror("无效文件", "请拖放PDF文件或支持的图像文件(JPEG, PNG等)。")
     
     def on_click(self, event):
         """处理点击打开文件对话框"""
         file_paths = filedialog.askopenfilenames(
-            title="选择PDF文件",
-            filetypes=[("PDF文件", "*.pdf")],
+            title="选择文件",
+            filetypes=[
+                ("所有支持的文件", "*.pdf;*.jpg;*.jpeg;*.png;*.bmp;*.tiff;*.tif"),
+                ("PDF文件", "*.pdf"),
+                ("图像文件", "*.jpg;*.jpeg;*.png;*.bmp;*.tiff;*.tif")
+            ],
             initialdir=os.path.expanduser("~\\Documents")
         )
         added_count = 0
@@ -585,23 +670,37 @@ class OCRApp(tk.Tk if not TKDND_AVAILABLE else TkinterDnD.Tk):
             added_count += 1
         
         if added_count > 0:
-            self.status_label.config(text=f"已添加 {added_count} 个PDF文件到队列")
+            self.status_label.config(text=f"已添加 {added_count} 个文件到队列")
     
     def add_file_to_queue(self, file_path):
         """添加文件到队列并更新显示"""
         if file_path not in self.file_queue:  # 避免重复添加
             self.file_queue.append(file_path)
-            file_size = get_pdf_size_mb(file_path)
-            self.file_listbox.insert(
-                tk.END, 
-                f"{os.path.basename(file_path)} ({file_size:.1f} MB)"
-            )
+            
+            # 对于图像文件，显示图像标签
+            file_ext = os.path.splitext(file_path)[1].lower()
+            if is_image_file(file_path):
+                file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB
+                self.file_listbox.insert(
+                    tk.END, 
+                    f"{os.path.basename(file_path)} ({file_size:.1f} MB) [图像]"
+                )
+            else:
+                file_size = get_pdf_size_mb(file_path)
+                self.file_listbox.insert(
+                    tk.END, 
+                    f"{os.path.basename(file_path)} ({file_size:.1f} MB)"
+                )
     
     def add_files(self):
         """批量添加文件到队列"""
         file_paths = filedialog.askopenfilenames(
-            title="选择PDF文件",
-            filetypes=[("PDF文件", "*.pdf")],
+            title="选择文件",
+            filetypes=[
+                ("所有支持的文件", "*.pdf;*.jpg;*.jpeg;*.png;*.bmp;*.tiff;*.tif"),
+                ("PDF文件", "*.pdf"),
+                ("图像文件", "*.jpg;*.jpeg;*.png;*.bmp;*.tiff;*.tif")
+            ],
             initialdir=os.path.expanduser("~\\Documents")
         )
         added_count = 0
@@ -610,7 +709,7 @@ class OCRApp(tk.Tk if not TKDND_AVAILABLE else TkinterDnD.Tk):
             added_count += 1
         
         if added_count > 0:
-            self.status_label.config(text=f"已添加 {added_count} 个PDF文件到队列")
+            self.status_label.config(text=f"已添加 {added_count} 个文件到队列")
     
     def remove_selected(self):
         """移除选定的文件"""
@@ -880,11 +979,15 @@ class OCRApp(tk.Tk if not TKDND_AVAILABLE else TkinterDnD.Tk):
 
 if __name__ == "__main__":
     # 显示欢迎信息
-    print("启动 Mistral OCR PDF 转换工具...")
+    print("启动 Mistral OCR 转换工具...")
     
     if not TKDND_AVAILABLE:
         print("警告: tkinterdnd2 模块未安装。拖放功能将不可用。")
         print("要启用拖放功能，请安装: pip install tkinterdnd2")
+    
+    if not PILLOW_AVAILABLE:
+        print("警告: Pillow 模块未安装。图像转换功能将不可用。")
+        print("要启用图像转换功能，请安装: pip install pillow")
     
     # 启动应用
     app = OCRApp()
